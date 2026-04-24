@@ -1234,6 +1234,11 @@ app.delete('/api/livestream/:id', asyncHandler(async (req, res) => {
 }));
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 404 HANDLER
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.use((req, res) => {
   res.status(404).json({
     error: `Route not found: ${req.method} ${req.path}`,
     routes: [
