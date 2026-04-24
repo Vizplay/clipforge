@@ -746,14 +746,14 @@ app.post('/api/livestream', asyncHandler(async (req, res) => {
   let stream;
   try {
     stream = await video.liveStreams.create({
-      playback_policy:     ['public'],
-      new_asset_settings:  {
+      playback_policy:  ['public'],
+      new_asset_settings: {
         playback_policy: ['public'],
         video_quality:   'plus',
       },
-      reduced_latency:     false,
-      reconnect_window:    60,          // seconds to wait for reconnect
-      max_continuous_duration: Math.min(windowMins * 60 * 10, 43200), // Mux max 12hr
+      latency_mode:             'standard',
+      reconnect_window:         60,
+      max_continuous_duration:  Math.min(windowMins * 60 * 10, 43200),
     });
   } catch (err) {
     const msg = muxErrorMessage(err);
@@ -1234,9 +1234,149 @@ app.delete('/api/livestream/:id', asyncHandler(async (req, res) => {
 }));
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 404 HANDLER
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// MERGE ROUTES
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── POST /api/merge ───────────────────────────────────────────────────────────
+/**
+ * Merges multiple Mux assets into one by creating a single new Mux asset
+ * with multiple input segments. Mux concatenates them server-side —
+ * no FFmpeg needed on your server, no large file transfers.
+ *
+ * Request body:
+ *   {
+ *     segments: [
+ *       { assetId: string, playbackId: string },  ← in order
+ *       { assetId: string, playbackId: string },
+ *       ...
+ *     ],
+ *     title?: string   ← optional label stored in response only
+ *   }
+ *
+ * Rules:
+ *   - Min 2 segments, max 10
+ *   - All assets must be status 'ready' before merging
+ *   - Order in array = order in final video
+ *
+ * Response:
+ *   {
+ *     mergedAssetId: string,
+ *     status:        'preparing',
+ *     segmentCount:  number,
+ *     title:         string,
+ *     message:       string,
+ *   }
+ */
+app.post('/api/merge', asyncHandler(async (req, res) => {
+  const { segments, title = 'Merged Video' } = req.body;
+
+  // ── Validate ───────────────────────────────────────────────────────────────
+  if (!Array.isArray(segments) || segments.length < 2) {
+    return res.status(400).json({ error: 'segments must be an array of at least 2 items' });
+  }
+  if (segments.length > 10) {
+    return res.status(400).json({ error: 'Maximum 10 segments per merge' });
+  }
+  for (const [i, seg] of segments.entries()) {
+    if (!seg.assetId?.trim()) {
+      return res.status(400).json({ error: `segments[${i}].assetId is required` });
+    }
+  }
+
+  console.log(`[merge] Merging ${segments.length} segments: ${segments.map(s => s.assetId).join(', ')}`);
+
+  // ── Build Mux multi-input asset ────────────────────────────────────────────
+  // Mux supports multiple inputs in one asset creation call.
+  // It concatenates them in order automatically.
+  const inputs = segments.map(seg => ({
+    url: `mux://assets/${seg.assetId}`,
+  }));
+
+  let merged;
+  try {
+    merged = await video.assets.create({
+      input:           inputs,
+      playback_policy: ['public'],
+      video_quality:   'plus',
+    });
+  } catch (err) {
+    const msg = muxErrorMessage(err);
+    console.error(`[merge] Mux error: ${msg}`);
+    return res.status(502).json({ error: `Mux merge failed: ${msg}` });
+  }
+
+  res.status(201).json({
+    mergedAssetId: merged.id,
+    status:        'preparing',
+    segmentCount:  segments.length,
+    title,
+    message:       `Merging ${segments.length} clips — poll GET /api/asset-status/${merged.id} for status`,
+  });
+}));
+
+// ── GET /api/asset-status/:assetId ───────────────────────────────────────────
+/**
+ * Polls any Mux asset status by assetId directly (not via uploadId).
+ * Used for polling merged asset status after POST /api/merge.
+ *
+ * Response:
+ *   {
+ *     status:            'preparing' | 'ready' | 'errored',
+ *     assetId:           string,
+ *     playbackId:        string | null,
+ *     duration:          number | null,
+ *     durationFormatted: string | null,
+ *     durationHuman:     string | null,
+ *     streamUrl:         string | null,
+ *     downloadUrl:       string | null,
+ *     thumbnailUrl:      string | null,
+ *   }
+ */
+app.get('/api/asset-status/:assetId', asyncHandler(async (req, res) => {
+  const { assetId } = req.params;
+
+  if (!assetId?.trim()) {
+    return res.status(400).json({ error: 'assetId is required' });
+  }
+
+  let asset;
+  try {
+    asset = await video.assets.retrieve(assetId);
+  } catch (err) {
+    if (err?.status === 404) {
+      return res.status(404).json({ error: `Asset not found: ${assetId}` });
+    }
+    return res.status(502).json({ error: `Mux error: ${muxErrorMessage(err)}` });
+  }
+
+  if (asset.status === 'errored') {
+    return res.status(422).json({
+      status:  'errored',
+      assetId: asset.id,
+      error:   'Asset processing failed in Mux.',
+    });
+  }
+
+  const playbackId  = asset.playback_ids?.[0]?.id ?? null;
+  const downloadUrl = asset.status === 'ready'
+    ? buildDownloadUrl(playbackId, asset.static_renditions)
+    : null;
+
+  res.json({
+    status:            asset.status,
+    assetId:           asset.id,
+    playbackId,
+    duration:          asset.duration          ?? null,
+    durationFormatted: asset.duration != null   ? formatDuration(asset.duration) : null,
+    durationHuman:     asset.duration != null   ? formatHuman(asset.duration)    : null,
+    streamUrl:         playbackId ? `https://stream.mux.com/${playbackId}.m3u8`           : null,
+    downloadUrl,
+    thumbnailUrl:      playbackId ? `https://image.mux.com/${playbackId}/thumbnail.jpg`   : null,
+  });
+}));
+
+
 
 app.use((req, res) => {
   res.status(404).json({
@@ -1258,7 +1398,8 @@ app.use((req, res) => {
       'PATCH  /api/livestream/:id/window',
       'POST   /api/livestream/:id/clip',
       'DELETE /api/livestream/:id',
-      'GET    /api/livestreams',
+      'POST   /api/merge',
+      'GET    /api/asset-status/:assetId',
     ],
   });
 });
