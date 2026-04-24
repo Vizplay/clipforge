@@ -344,14 +344,35 @@ app.get('/api/asset/:uploadId', asyncHandler(async (req, res) => {
  *   clipDurationHuman, message
  */
 app.post('/api/clip', asyncHandler(async (req, res) => {
+  console.log('[clip] Request body:', JSON.stringify(req.body));
   const { assetId, playbackId, duration, mode, startTime, endTime, minutes } = req.body;
 
   // ── Validate required fields ──────────────────────────────────────────────
   if (!assetId?.trim()) {
     return res.status(400).json({ error: 'assetId is required' });
   }
-  if (!playbackId?.trim()) {
-    return res.status(400).json({ error: 'playbackId is required' });
+  if (!duration === undefined || duration === null || isNaN(parseFloat(duration))) {
+    return res.status(400).json({ error: 'duration (total video seconds) is required' });
+  }
+  if (!['custom', 'first', 'last'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be: custom | first | last' });
+  }
+
+  // playbackId required for HLS-based clipping
+  // If not sent by frontend, attempt to look it up from Mux
+  let resolvedPlaybackId = playbackId;
+  if (!resolvedPlaybackId?.trim()) {
+    console.log('[clip] playbackId missing — looking up from assetId:', assetId);
+    try {
+      const asset = await video.assets.retrieve(assetId);
+      resolvedPlaybackId = asset.playback_ids?.[0]?.id ?? null;
+      console.log('[clip] Resolved playbackId:', resolvedPlaybackId);
+    } catch (err) {
+      console.error('[clip] Could not resolve playbackId:', muxErrorMessage(err));
+    }
+    if (!resolvedPlaybackId) {
+      return res.status(400).json({ error: 'playbackId is required and could not be resolved from assetId' });
+    }
   }
   if (duration === undefined || duration === null || isNaN(parseFloat(duration))) {
     return res.status(400).json({ error: 'duration (total video seconds) is required' });
@@ -423,7 +444,7 @@ app.post('/api/clip', asyncHandler(async (req, res) => {
   try {
     clip = await video.assets.create({
       input: [{
-        url:        `https://stream.mux.com/${playbackId}.m3u8`,
+        url:        `https://stream.mux.com/${resolvedPlaybackId}.m3u8`,
         start_time: parseFloat(start.toFixed(3)),
         end_time:   parseFloat(end.toFixed(3)),
       }],
