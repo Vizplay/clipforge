@@ -608,15 +608,84 @@ app.delete('/api/assets/batch', asyncHandler(async (req, res) => {
   });
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 404 HANDLER
-// ─────────────────────────────────────────────────────────────────────────────
+// ── GET /api/assets ───────────────────────────────────────────────────────────
+/**
+ * Lists all assets in the Mux environment that are not deleted.
+ * Paginates automatically — returns up to 100 assets per call.
+ * Supports optional ?limit= and ?page= query params.
+ *
+ * Response:
+ *   {
+ *     assets: [
+ *       {
+ *         assetId:           string,
+ *         status:            'preparing' | 'ready' | 'errored',
+ *         duration:          number | null,
+ *         durationFormatted: string | null,
+ *         durationHuman:     string | null,
+ *         playbackId:        string | null,
+ *         streamUrl:         string | null,
+ *         thumbnailUrl:      string | null,
+ *         createdAt:         string,   ← ISO timestamp
+ *         mp4Support:        string | null,
+ *         sourceAssetId:     string | null,  ← set if this is a clip
+ *         isClip:            boolean,
+ *       }
+ *     ],
+ *     total: number,
+ *     page:  number,
+ *     limit: number,
+ *   }
+ */
+app.get('/api/assets', asyncHandler(async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit ?? '100', 10), 100);
+  const page  = Math.max(parseInt(req.query.page  ?? '1',   10), 1);
+
+  let assetList;
+  try {
+    assetList = await video.assets.list({ limit, page });
+  } catch (err) {
+    const msg = muxErrorMessage(err);
+    console.error(`[assets] Mux error listing assets: ${msg}`);
+    return res.status(502).json({ error: `Mux error: ${msg}` });
+  }
+
+  const assets = (assetList.data ?? assetList ?? []).map(asset => {
+    const playbackId = asset.playback_ids?.[0]?.id ?? null;
+    return {
+      assetId:           asset.id,
+      status:            asset.status,
+      duration:          asset.duration          ?? null,
+      durationFormatted: asset.duration != null   ? formatDuration(asset.duration) : null,
+      durationHuman:     asset.duration != null   ? formatHuman(asset.duration)    : null,
+      playbackId,
+      streamUrl:         playbackId ? `https://stream.mux.com/${playbackId}.m3u8`          : null,
+      thumbnailUrl:      playbackId ? `https://image.mux.com/${playbackId}/thumbnail.jpg`   : null,
+      createdAt:         asset.created_at
+                           ? new Date(parseInt(asset.created_at, 10) * 1000).toISOString()
+                           : null,
+      mp4Support:        asset.mp4_support        ?? null,
+      sourceAssetId:     asset.source_asset_id    ?? null,
+      isClip:            !!asset.source_asset_id,
+    };
+  });
+
+  res.json({
+    assets,
+    total: assets.length,
+    page,
+    limit,
+  });
+}));
+
+
 
 app.use((req, res) => {
   res.status(404).json({
     error: `Route not found: ${req.method} ${req.path}`,
     routes: [
       'GET    /health',
+      'GET    /api/assets',
       'POST   /api/upload-url',
       'GET    /api/asset/:uploadId',
       'POST   /api/clip',
