@@ -344,11 +344,14 @@ app.get('/api/asset/:uploadId', asyncHandler(async (req, res) => {
  *   clipDurationHuman, message
  */
 app.post('/api/clip', asyncHandler(async (req, res) => {
-  const { assetId, duration, mode, startTime, endTime, minutes } = req.body;
+  const { assetId, playbackId, duration, mode, startTime, endTime, minutes } = req.body;
 
   // ── Validate required fields ──────────────────────────────────────────────
   if (!assetId?.trim()) {
     return res.status(400).json({ error: 'assetId is required' });
+  }
+  if (!playbackId?.trim()) {
+    return res.status(400).json({ error: 'playbackId is required' });
   }
   if (duration === undefined || duration === null || isNaN(parseFloat(duration))) {
     return res.status(400).json({ error: 'duration (total video seconds) is required' });
@@ -420,7 +423,7 @@ app.post('/api/clip', asyncHandler(async (req, res) => {
   try {
     clip = await video.assets.create({
       input: [{
-        url:        `mux-asset://${assetId}`,
+        url:        `https://stream.mux.com/${playbackId}.m3u8`,
         start_time: parseFloat(start.toFixed(3)),
         end_time:   parseFloat(end.toFixed(3)),
       }],
