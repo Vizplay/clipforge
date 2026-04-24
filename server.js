@@ -4,14 +4,24 @@
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  Stack:   Node.js 18+ · Express 4 · @mux/mux-node · ESM                ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
- * ║  Endpoints:                                                              ║
+ * ║  VOD Endpoints:                                                          ║
  * ║    GET    /health                    → Uptime + Mux credentials check    ║
+ * ║    GET    /api/assets                → List all Mux assets               ║
  * ║    POST   /api/upload-url            → Get Mux direct upload URL         ║
  * ║    GET    /api/asset/:uploadId       → Poll asset status after upload     ║
  * ║    POST   /api/clip                  → Create clip (custom|first|last)    ║
  * ║    GET    /api/clip/:clipAssetId     → Poll clip status + download URL    ║
  * ║    DELETE /api/asset/:assetId        → Delete one asset (clip or source)  ║
  * ║    DELETE /api/assets/batch          → Delete multiple assets at once     ║
+ * ╠══════════════════════════════════════════════════════════════════════════╣
+ * ║  Live Stream Endpoints:                                                  ║
+ * ║    POST   /api/livestream            → Create a new Mux live stream      ║
+ * ║    GET    /api/livestream/:id        → Get stream status + ingest URL     ║
+ * ║    POST   /api/livestream/:id/end    → End / disable a live stream        ║
+ * ║    DELETE /api/livestream/:id        → Delete stream + recording asset    ║
+ * ║    GET    /api/livestream/:id/window → Get rolling DVR window info        ║
+ * ║    POST   /api/livestream/:id/clip   → Clip from live stream recording    ║
+ * ║    GET    /api/livestreams           → List all live streams              ║
  * ╠══════════════════════════════════════════════════════════════════════════╣
  * ║  Required env vars:                                                      ║
  * ║    MUX_TOKEN_ID       — from dashboard.mux.com → API Access Tokens       ║
@@ -23,6 +33,7 @@
  * ║    NODE_ENV           — 'development' | 'production'                     ║
  * ║    RATE_LIMIT_MAX     — requests per 15 min per IP, default 100          ║
  * ║    MAX_CLIP_BATCH     — max IDs per batch delete, default 20             ║
+ * ║    DVR_WINDOW_MINS    — rolling DVR window in minutes, default 60        ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  */
 
@@ -44,6 +55,7 @@ const {
   NODE_ENV        = 'development',
   RATE_LIMIT_MAX  = '100',
   MAX_CLIP_BATCH  = '20',
+  DVR_WINDOW_MINS = '60',
 } = process.env;
 
 const IS_PROD = NODE_ENV === 'production';
@@ -53,6 +65,25 @@ if (!MUX_TOKEN_ID || !MUX_TOKEN_SECRET) {
   console.error('[BOOT]     Set them in your Railway / Render environment variables.');
   process.exit(1);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IN-MEMORY LIVE STREAM REGISTRY
+// Tracks active streams + their rolling window config across requests.
+// On server restart this resets — Mux is the source of truth for stream state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const streamRegistry = new Map();
+// Entry shape:
+// {
+//   streamId:       string,   — Mux live stream ID
+//   playbackId:     string,
+//   ingestUrl:      string,   — rtmps://global-live.mux.com:443/app/{streamKey}
+//   streamKey:      string,
+//   startedAt:      Date,
+//   windowMins:     number,   — rolling window setting (how many mins to keep)
+//   status:         'idle' | 'active' | 'ended',
+//   recordingAssetId: null | string,  — set when stream ends
+// }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MUX CLIENT
@@ -680,7 +711,529 @@ app.get('/api/assets', asyncHandler(async (req, res) => {
 
 
 
-app.use((req, res) => {
+// ═════════════════════════════════════════════════════════════════════════════
+// LIVE STREAM ROUTES
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── POST /api/livestream ──────────────────────────────────────────────────────
+/**
+ * Creates a new Mux live stream with DVR enabled.
+ * DVR lets viewers rewind and clip from the live recording in real time.
+ *
+ * Request body (all optional):
+ *   windowMins  number  — rolling window to keep in minutes (default: DVR_WINDOW_MINS)
+ *   name        string  — friendly label stored in registry only
+ *
+ * Response:
+ *   {
+ *     streamId:   string,   — Mux live stream ID
+ *     streamKey:  string,   — RTMP stream key
+ *     ingestUrl:  string,   — full RTMPS URL for OBS / streaming software
+ *     playbackId: string,   — for the HLS player
+ *     streamUrl:  string,   — HLS .m3u8 URL
+ *     windowMins: number,
+ *     status:     'idle',
+ *   }
+ */
+app.post('/api/livestream', asyncHandler(async (req, res) => {
+  const windowMins = parseFloat(req.body.windowMins ?? DVR_WINDOW_MINS);
+  const name       = req.body.name?.trim() ?? 'Live Stream';
+
+  if (isNaN(windowMins) || windowMins <= 0) {
+    return res.status(400).json({ error: 'windowMins must be a positive number' });
+  }
+
+  let stream;
+  try {
+    stream = await video.liveStreams.create({
+      playback_policy:     ['public'],
+      new_asset_settings:  {
+        playback_policy: ['public'],
+        video_quality:   'plus',
+      },
+      reduced_latency:     false,
+      reconnect_window:    60,          // seconds to wait for reconnect
+      max_continuous_duration: Math.min(windowMins * 60 * 10, 43200), // Mux max 12hr
+    });
+  } catch (err) {
+    const msg = muxErrorMessage(err);
+    console.error(`[livestream] Mux error creating stream: ${msg}`);
+    return res.status(502).json({ error: `Mux stream creation failed: ${msg}` });
+  }
+
+  const playbackId = stream.playback_ids?.[0]?.id ?? null;
+  const streamKey  = stream.stream_key;
+  const ingestUrl  = `rtmps://global-live.mux.com:443/app/${streamKey}`;
+
+  // Register in memory
+  streamRegistry.set(stream.id, {
+    streamId:          stream.id,
+    playbackId,
+    ingestUrl,
+    streamKey,
+    name,
+    startedAt:         null,
+    windowMins,
+    status:            'idle',
+    recordingAssetId:  null,
+  });
+
+  console.log(`[livestream] Created stream ${stream.id} — window: ${windowMins} min`);
+
+  res.status(201).json({
+    streamId:   stream.id,
+    streamKey,
+    ingestUrl,
+    playbackId,
+    streamUrl:  playbackId ? `https://stream.mux.com/${playbackId}.m3u8` : null,
+    windowMins,
+    status:     'idle',
+    name,
+  });
+}));
+
+// ── GET /api/livestream/:id ───────────────────────────────────────────────────
+/**
+ * Gets the current status of a live stream.
+ * Merges Mux API status with in-memory registry data.
+ *
+ * Response:
+ *   {
+ *     streamId, streamKey, ingestUrl, playbackId, streamUrl,
+ *     status:     'idle' | 'active' | 'ended' | 'disabled',
+ *     windowMins, startedAt, elapsedSecs, elapsedFormatted,
+ *     recordingAssetId, name,
+ *     dvr: {
+ *       windowMins,
+ *       windowStart: number,   ← seconds from stream start to clip from
+ *       windowEnd:   number,   ← current elapsed seconds
+ *     }
+ *   }
+ */
+app.get('/api/livestream/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  let stream;
+  try {
+    stream = await video.liveStreams.retrieve(id);
+  } catch (err) {
+    if (err?.status === 404) {
+      return res.status(404).json({ error: `Live stream not found: ${id}` });
+    }
+    return res.status(502).json({ error: `Mux error: ${muxErrorMessage(err)}` });
+  }
+
+  const reg        = streamRegistry.get(id) ?? {};
+  const playbackId = stream.playback_ids?.[0]?.id ?? null;
+  const now        = Date.now();
+  const startedAt  = reg.startedAt ?? null;
+  const elapsedSecs = startedAt ? Math.floor((now - startedAt.getTime()) / 1000) : 0;
+  const windowMins  = reg.windowMins ?? parseFloat(DVR_WINDOW_MINS);
+
+  // DVR rolling window: user can only clip within the last windowMins
+  const windowSecs  = windowMins * 60;
+  const windowStart = Math.max(0, elapsedSecs - windowSecs);
+  const windowEnd   = elapsedSecs;
+
+  // Sync status from Mux into registry
+  if (reg.status !== 'ended') {
+    const muxStatus = stream.status; // 'idle' | 'active' | 'disabled'
+    if (muxStatus === 'active' && reg.status !== 'active') {
+      reg.startedAt = reg.startedAt ?? new Date();
+      reg.status    = 'active';
+      streamRegistry.set(id, reg);
+    }
+  }
+
+  res.json({
+    streamId:          stream.id,
+    streamKey:         stream.stream_key,
+    ingestUrl:         reg.ingestUrl ?? `rtmps://global-live.mux.com:443/app/${stream.stream_key}`,
+    playbackId,
+    streamUrl:         playbackId ? `https://stream.mux.com/${playbackId}.m3u8` : null,
+    status:            reg.status ?? stream.status,
+    name:              reg.name   ?? 'Live Stream',
+    windowMins,
+    startedAt:         startedAt?.toISOString() ?? null,
+    elapsedSecs,
+    elapsedFormatted:  formatDuration(elapsedSecs),
+    recordingAssetId:  reg.recordingAssetId ?? null,
+    dvr: {
+      windowMins,
+      windowStart,
+      windowEnd,
+      windowStartFormatted: formatDuration(windowStart),
+      windowEndFormatted:   formatDuration(windowEnd),
+    },
+  });
+}));
+
+// ── POST /api/livestream/:id/end ──────────────────────────────────────────────
+/**
+ * Ends (disables) a live stream. Mux will finalize the recording asset.
+ * Poll GET /api/livestream/:id/recording until recordingAssetId is set.
+ *
+ * Response: { streamId, status: 'ended', message }
+ */
+app.post('/api/livestream/:id/end', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await video.liveStreams.disable(id);
+  } catch (err) {
+    if (err?.status === 404) {
+      return res.status(404).json({ error: `Live stream not found: ${id}` });
+    }
+    return res.status(502).json({ error: `Mux error: ${muxErrorMessage(err)}` });
+  }
+
+  // Update registry
+  const reg = streamRegistry.get(id);
+  if (reg) {
+    reg.status = 'ended';
+    streamRegistry.set(id, reg);
+  }
+
+  console.log(`[livestream] Stream ${id} ended`);
+
+  res.json({
+    streamId: id,
+    status:   'ended',
+    message:  'Stream ended. Recording asset will be available shortly.',
+  });
+}));
+
+// ── GET /api/livestream/:id/recording ─────────────────────────────────────────
+/**
+ * Polls for the VOD recording asset after a stream ends.
+ * Call every 5 seconds until recordingAssetId is returned.
+ *
+ * Response:
+ *   {
+ *     ready:             boolean,
+ *     recordingAssetId:  string | null,
+ *     playbackId:        string | null,
+ *     streamUrl:         string | null,
+ *     duration:          number | null,
+ *     durationFormatted: string | null,
+ *   }
+ */
+app.get('/api/livestream/:id/recording', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  let stream;
+  try {
+    stream = await video.liveStreams.retrieve(id);
+  } catch (err) {
+    if (err?.status === 404) {
+      return res.status(404).json({ error: `Live stream not found: ${id}` });
+    }
+    return res.status(502).json({ error: `Mux error: ${muxErrorMessage(err)}` });
+  }
+
+  // Mux stores the recording asset ID on the live stream object
+  const recordingAssetId = stream.active_asset_id
+                        ?? stream.recent_asset_ids?.[0]
+                        ?? null;
+
+  if (!recordingAssetId) {
+    return res.json({ ready: false, recordingAssetId: null });
+  }
+
+  // Update registry
+  const reg = streamRegistry.get(id);
+  if (reg && !reg.recordingAssetId) {
+    reg.recordingAssetId = recordingAssetId;
+    streamRegistry.set(id, reg);
+  }
+
+  // Fetch the recording asset for full details
+  let asset;
+  try {
+    asset = await video.assets.retrieve(recordingAssetId);
+  } catch {
+    return res.json({ ready: false, recordingAssetId });
+  }
+
+  const playbackId = asset.playback_ids?.[0]?.id ?? null;
+
+  res.json({
+    ready:             asset.status === 'ready',
+    status:            asset.status,
+    recordingAssetId,
+    playbackId,
+    streamUrl:         playbackId ? `https://stream.mux.com/${playbackId}.m3u8` : null,
+    duration:          asset.duration         ?? null,
+    durationFormatted: asset.duration != null  ? formatDuration(asset.duration) : null,
+    durationHuman:     asset.duration != null  ? formatHuman(asset.duration)    : null,
+  });
+}));
+
+// ── GET /api/livestream/:id/window ────────────────────────────────────────────
+/**
+ * Returns the current rolling DVR window — what time range is available to clip.
+ * The window shifts forward as the stream runs; only the last windowMins is clippable.
+ *
+ * Response:
+ *   {
+ *     streamId, windowMins, elapsedSecs,
+ *     windowStart, windowEnd,        ← seconds from stream start
+ *     windowStartFormatted,
+ *     windowEndFormatted,
+ *     elapsedFormatted,
+ *     clippableRange: { start, end } ← same as window
+ *   }
+ */
+app.get('/api/livestream/:id/window', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const reg    = streamRegistry.get(id);
+
+  if (!reg) {
+    return res.status(404).json({ error: `Stream ${id} not found in registry. Reload the page.` });
+  }
+
+  const now         = Date.now();
+  const startedAt   = reg.startedAt;
+  const elapsedSecs = startedAt ? Math.floor((now - startedAt.getTime()) / 1000) : 0;
+  const windowSecs  = reg.windowMins * 60;
+  const windowStart = Math.max(0, elapsedSecs - windowSecs);
+  const windowEnd   = elapsedSecs;
+
+  res.json({
+    streamId:             id,
+    windowMins:           reg.windowMins,
+    elapsedSecs,
+    elapsedFormatted:     formatDuration(elapsedSecs),
+    windowStart,
+    windowEnd,
+    windowStartFormatted: formatDuration(windowStart),
+    windowEndFormatted:   formatDuration(windowEnd),
+    clippableRange:       { start: windowStart, end: windowEnd },
+  });
+}));
+
+// ── PATCH /api/livestream/:id/window ─────────────────────────────────────────
+/**
+ * Updates the rolling window size for an active stream.
+ * Takes effect immediately — clips will use the new window on next request.
+ *
+ * Request body: { windowMins: number }
+ * Response: { streamId, windowMins, message }
+ */
+app.patch('/api/livestream/:id/window', asyncHandler(async (req, res) => {
+  const { id }     = req.params;
+  const windowMins = parseFloat(req.body.windowMins);
+
+  if (isNaN(windowMins) || windowMins <= 0) {
+    return res.status(400).json({ error: 'windowMins must be a positive number' });
+  }
+
+  const reg = streamRegistry.get(id);
+  if (!reg) {
+    return res.status(404).json({ error: `Stream ${id} not found in registry` });
+  }
+
+  reg.windowMins = windowMins;
+  streamRegistry.set(id, reg);
+
+  res.json({
+    streamId:   id,
+    windowMins,
+    message:    `Rolling window updated to ${windowMins} minutes`,
+  });
+}));
+
+// ── POST /api/livestream/:id/clip ─────────────────────────────────────────────
+/**
+ * Creates a clip from a live stream recording.
+ * Works during the stream (if recording asset exists) or after it ends.
+ *
+ * Three modes — same as VOD clipping but times are relative to stream start:
+ *   custom — exact start/end in seconds from stream start
+ *   last   — last X minutes of current stream
+ *   first  — first X minutes of stream
+ *
+ * Request body:
+ *   {
+ *     recordingAssetId: string,   — from GET /api/livestream/:id/recording
+ *     mode:             'custom' | 'last' | 'first',
+ *     startTime?:       number,   — seconds from stream start (custom mode)
+ *     endTime?:         number,
+ *     minutes?:         number,   — for first/last mode
+ *     totalDuration?:   number,   — required for first/last if stream still live
+ *   }
+ *
+ * Response: same shape as POST /api/clip
+ */
+app.post('/api/livestream/:id/clip', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { recordingAssetId, mode, startTime, endTime, minutes, totalDuration } = req.body;
+
+  console.log(`[livestream-clip] Stream ${id} body:`, JSON.stringify(req.body));
+
+  if (!recordingAssetId?.trim()) {
+    return res.status(400).json({ error: 'recordingAssetId is required' });
+  }
+  if (!['custom', 'first', 'last'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be: custom | first | last' });
+  }
+
+  // Get total duration — from request body or fetch from Mux
+  let duration = parseFloat(totalDuration ?? 0);
+  if (!duration) {
+    try {
+      const asset = await video.assets.retrieve(recordingAssetId);
+      duration    = asset.duration ?? 0;
+    } catch (err) {
+      return res.status(502).json({ error: `Could not fetch recording duration: ${muxErrorMessage(err)}` });
+    }
+  }
+
+  const reg = streamRegistry.get(id);
+
+  // For live streams still running — use elapsed time as duration
+  if (!duration && reg?.startedAt) {
+    duration = Math.floor((Date.now() - reg.startedAt.getTime()) / 1000);
+  }
+
+  let start, end;
+
+  if (mode === 'custom') {
+    try {
+      start = parseTimeInput(startTime);
+      end   = parseTimeInput(endTime);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  } else if (mode === 'first') {
+    const mins = parseFloat(minutes);
+    if (!mins || isNaN(mins) || mins <= 0) {
+      return res.status(400).json({ error: 'minutes must be positive for first mode' });
+    }
+    start = 0;
+    end   = Math.min(mins * 60, duration);
+  } else {
+    // last
+    const mins = parseFloat(minutes);
+    if (!mins || isNaN(mins) || mins <= 0) {
+      return res.status(400).json({ error: 'minutes must be positive for last mode' });
+    }
+    // Enforce rolling window — can't clip further back than windowMins
+    const windowSecs = (reg?.windowMins ?? parseFloat(DVR_WINDOW_MINS)) * 60;
+    const maxLookback = Math.min(mins * 60, windowSecs);
+    start = Math.max(0, duration - maxLookback);
+    end   = duration;
+  }
+
+  // Validate
+  if (end <= start) {
+    return res.status(400).json({ error: `End (${formatDuration(end)}) must be after start (${formatDuration(start)})` });
+  }
+  if ((end - start) < 1) {
+    return res.status(400).json({ error: 'Clip must be at least 1 second long' });
+  }
+
+  let clip;
+  try {
+    clip = await video.assets.create({
+      input: [{
+        url:        `mux://assets/${recordingAssetId}`,
+        start_time: parseFloat(start.toFixed(3)),
+        end_time:   parseFloat(end.toFixed(3)),
+      }],
+      playback_policy: ['public'],
+      video_quality:   'plus',
+    });
+  } catch (err) {
+    const msg = muxErrorMessage(err);
+    console.error(`[livestream-clip] Mux error: ${msg}`);
+    if (err?.status === 404) {
+      return res.status(404).json({ error: `Recording asset not found: ${recordingAssetId}` });
+    }
+    return res.status(502).json({ error: `Mux clip creation failed: ${msg}` });
+  }
+
+  const clipDuration = end - start;
+
+  res.status(201).json({
+    clipAssetId:           clip.id,
+    mode,
+    clipStart:             start,
+    clipEnd:               end,
+    clipDuration,
+    clipStartFormatted:    formatDuration(start),
+    clipEndFormatted:      formatDuration(end),
+    clipDurationFormatted: formatDuration(clipDuration),
+    clipDurationHuman:     formatHuman(clipDuration),
+    sourceStreamId:        id,
+    recordingAssetId,
+    message: `Live clip: ${formatDuration(start)} → ${formatDuration(end)} (${formatHuman(clipDuration)})`,
+  });
+}));
+
+// ── GET /api/livestreams ──────────────────────────────────────────────────────
+/**
+ * Lists all live streams from Mux, merged with in-memory registry data.
+ *
+ * Response: { streams: [...], total: number }
+ */
+app.get('/api/livestreams', asyncHandler(async (req, res) => {
+  let list;
+  try {
+    list = await video.liveStreams.list({ limit: 50 });
+  } catch (err) {
+    return res.status(502).json({ error: `Mux error: ${muxErrorMessage(err)}` });
+  }
+
+  const streams = (list.data ?? list ?? []).map(stream => {
+    const reg        = streamRegistry.get(stream.id) ?? {};
+    const playbackId = stream.playback_ids?.[0]?.id ?? null;
+    return {
+      streamId:         stream.id,
+      status:           reg.status ?? stream.status,
+      name:             reg.name   ?? 'Live Stream',
+      playbackId,
+      streamUrl:        playbackId ? `https://stream.mux.com/${playbackId}.m3u8` : null,
+      ingestUrl:        reg.ingestUrl ?? null,
+      windowMins:       reg.windowMins ?? parseFloat(DVR_WINDOW_MINS),
+      startedAt:        reg.startedAt?.toISOString() ?? null,
+      recordingAssetId: reg.recordingAssetId ?? stream.active_asset_id ?? null,
+      createdAt:        stream.created_at
+                          ? new Date(parseInt(stream.created_at, 10) * 1000).toISOString()
+                          : null,
+    };
+  });
+
+  res.json({ streams, total: streams.length });
+}));
+
+// ── DELETE /api/livestream/:id ────────────────────────────────────────────────
+/**
+ * Deletes a Mux live stream and removes it from the registry.
+ * Does NOT delete the recording asset — use DELETE /api/asset/:assetId for that.
+ *
+ * Response: { deleted: true, streamId }
+ */
+app.delete('/api/livestream/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await video.liveStreams.delete(id);
+  } catch (err) {
+    if (err?.status === 404) {
+      streamRegistry.delete(id);
+      return res.json({ deleted: true, streamId: id, note: 'Already deleted or not found' });
+    }
+    return res.status(502).json({ error: `Mux error: ${muxErrorMessage(err)}` });
+  }
+
+  streamRegistry.delete(id);
+  console.log(`[livestream] Deleted stream ${id}`);
+
+  res.json({ deleted: true, streamId: id });
+}));
+
+
   res.status(404).json({
     error: `Route not found: ${req.method} ${req.path}`,
     routes: [
@@ -692,6 +1245,15 @@ app.use((req, res) => {
       'GET    /api/clip/:clipAssetId',
       'DELETE /api/asset/:assetId',
       'DELETE /api/assets/batch',
+      'POST   /api/livestream',
+      'GET    /api/livestream/:id',
+      'POST   /api/livestream/:id/end',
+      'GET    /api/livestream/:id/recording',
+      'GET    /api/livestream/:id/window',
+      'PATCH  /api/livestream/:id/window',
+      'POST   /api/livestream/:id/clip',
+      'DELETE /api/livestream/:id',
+      'GET    /api/livestreams',
     ],
   });
 });
