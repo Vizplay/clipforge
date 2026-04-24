@@ -241,7 +241,7 @@ app.post('/api/upload-url', asyncHandler(async (_req, res) => {
       cors_origin:         ALLOWED_ORIGIN,
       new_asset_settings: {
         playback_policy: ['public'],
-        mp4_support:     'capped-1080p', // required for MP4 clip downloads
+        video_quality:   'plus',   // enables MP4 static renditions for download
       },
     });
   } catch (err) {
@@ -444,12 +444,12 @@ app.post('/api/clip', asyncHandler(async (req, res) => {
   try {
     clip = await video.assets.create({
       input: [{
-        url:        `https://stream.mux.com/${resolvedPlaybackId}.m3u8`,
+        url:        `mux://assets/${assetId}`,
         start_time: parseFloat(start.toFixed(3)),
         end_time:   parseFloat(end.toFixed(3)),
       }],
       playback_policy: ['public'],
-      mp4_support:     'capped-1080p',
+      video_quality:   'plus',     // 'basic' | 'plus' — needed for mp4 download
     });
   } catch (err) {
     const msg = muxErrorMessage(err);
