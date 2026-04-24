@@ -171,7 +171,9 @@ function formatHuman(seconds) {
 function buildDownloadUrl(playbackId, staticRenditions) {
   if (!playbackId) return null;
   const files = staticRenditions?.files ?? [];
-  for (const name of ['high.mp4', 'medium.mp4', 'low.mp4']) {
+  // capped-1080p produces: capped-1080p.mp4, 720p.mp4, 480p.mp4, 360p.mp4
+  const preferred = ['capped-1080p.mp4', '720p.mp4', '480p.mp4', '360p.mp4', 'high.mp4'];
+  for (const name of preferred) {
     if (files.some(f => f.name === name)) {
       return `https://stream.mux.com/${playbackId}/${name}`;
     }
@@ -180,7 +182,7 @@ function buildDownloadUrl(playbackId, staticRenditions) {
     return `https://stream.mux.com/${playbackId}/${files[0].name}`;
   }
   // Fallback — Mux serves this once mp4_support processing finishes
-  return `https://stream.mux.com/${playbackId}/high.mp4`;
+  return `https://stream.mux.com/${playbackId}/capped-1080p.mp4`;
 }
 
 /**
@@ -239,7 +241,7 @@ app.post('/api/upload-url', asyncHandler(async (_req, res) => {
       cors_origin:         ALLOWED_ORIGIN,
       new_asset_settings: {
         playback_policy: ['public'],
-        mp4_support:     'standard',    // required for MP4 clip downloads
+        mp4_support:     'capped-1080p', // required for MP4 clip downloads
       },
     });
   } catch (err) {
@@ -423,7 +425,7 @@ app.post('/api/clip', asyncHandler(async (req, res) => {
         end_time:   parseFloat(end.toFixed(3)),
       }],
       playback_policy: ['public'],
-      mp4_support:     'standard',
+      mp4_support:     'capped-1080p',
     });
   } catch (err) {
     const msg = muxErrorMessage(err);
