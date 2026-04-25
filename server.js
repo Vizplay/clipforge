@@ -42,6 +42,14 @@ import express           from 'express';
 import cors              from 'cors';
 import rateLimit         from 'express-rate-limit';
 import { randomUUID }    from 'crypto';
+import { execFile }      from 'child_process';
+import { promisify }     from 'util';
+import { createWriteStream, promises as fs } from 'fs';
+import { tmpdir }        from 'os';
+import { join }          from 'path';
+import { pipeline }      from 'stream/promises';
+
+const execFileAsync = promisify(execFile);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ENVIRONMENT & BOOT GUARD
@@ -265,14 +273,17 @@ app.get('/health', asyncHandler(async (_req, res) => {
  *
  * Response: { uploadUrl, uploadId }
  */
-app.post('/api/upload-url', asyncHandler(async (_req, res) => {
+app.post('/api/upload-url', asyncHandler(async (req, res) => {
+  const userId = req.body?.userId ?? req.query.userId ?? 'anonymous';
+
   let upload;
   try {
     upload = await video.uploads.create({
       cors_origin:         ALLOWED_ORIGIN,
       new_asset_settings: {
         playback_policy: ['public'],
-        video_quality:   'plus',   // enables MP4 static renditions for download
+        video_quality:   'plus',
+        passthrough:     userId,   // ← tag every asset with userId
       },
     });
   } catch (err) {
@@ -284,6 +295,7 @@ app.post('/api/upload-url', asyncHandler(async (_req, res) => {
   res.json({
     uploadUrl: upload.url,
     uploadId:  upload.id,
+    userId,
   });
 }));
 
@@ -376,7 +388,7 @@ app.get('/api/asset/:uploadId', asyncHandler(async (req, res) => {
  */
 app.post('/api/clip', asyncHandler(async (req, res) => {
   console.log('[clip] Request body:', JSON.stringify(req.body));
-  const { assetId, playbackId, duration, mode, startTime, endTime, minutes } = req.body;
+  const { assetId, playbackId, duration, mode, startTime, endTime, minutes, userId = 'anonymous' } = req.body;
 
   // ── Validate required fields ──────────────────────────────────────────────
   if (!assetId?.trim()) {
@@ -480,7 +492,8 @@ app.post('/api/clip', asyncHandler(async (req, res) => {
         end_time:   parseFloat(end.toFixed(3)),
       }],
       playback_policy: ['public'],
-      video_quality:   'plus',     // 'basic' | 'plus' — needed for mp4 download
+      video_quality:   'plus',
+      passthrough:     userId,   // ← tag clip with userId
     });
   } catch (err) {
     const msg = muxErrorMessage(err);
@@ -669,8 +682,9 @@ app.delete('/api/assets/batch', asyncHandler(async (req, res) => {
  *   }
  */
 app.get('/api/assets', asyncHandler(async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit ?? '100', 10), 100);
-  const page  = Math.max(parseInt(req.query.page  ?? '1',   10), 1);
+  const limit  = Math.min(parseInt(req.query.limit  ?? '100', 10), 100);
+  const page   = Math.max(parseInt(req.query.page   ?? '1',   10), 1);
+  const userId = req.query.userId ?? null;   // ← filter by user
 
   let assetList;
   try {
@@ -681,29 +695,37 @@ app.get('/api/assets', asyncHandler(async (req, res) => {
     return res.status(502).json({ error: `Mux error: ${msg}` });
   }
 
-  const assets = (assetList.data ?? assetList ?? []).map(asset => {
+  let assets = (assetList.data ?? assetList ?? []).map(asset => {
     const playbackId = asset.playback_ids?.[0]?.id ?? null;
     return {
       assetId:           asset.id,
       status:            asset.status,
+      userId:            asset.passthrough ?? 'anonymous',   // ← expose userId
       duration:          asset.duration          ?? null,
       durationFormatted: asset.duration != null   ? formatDuration(asset.duration) : null,
       durationHuman:     asset.duration != null   ? formatHuman(asset.duration)    : null,
       playbackId,
-      streamUrl:         playbackId ? `https://stream.mux.com/${playbackId}.m3u8`          : null,
-      thumbnailUrl:      playbackId ? `https://image.mux.com/${playbackId}/thumbnail.jpg`   : null,
+      streamUrl:         playbackId ? `https://stream.mux.com/${playbackId}.m3u8`         : null,
+      thumbnailUrl:      playbackId ? `https://image.mux.com/${playbackId}/thumbnail.jpg`  : null,
       createdAt:         asset.created_at
                            ? new Date(parseInt(asset.created_at, 10) * 1000).toISOString()
                            : null,
-      mp4Support:        asset.mp4_support        ?? null,
-      sourceAssetId:     asset.source_asset_id    ?? null,
+      mp4Support:        asset.mp4_support     ?? null,
+      sourceAssetId:     asset.source_asset_id ?? null,
       isClip:            !!asset.source_asset_id,
     };
   });
 
+  // Filter by userId if provided — client-side filter on passthrough field
+  // (Mux API does not support server-side passthrough filtering)
+  if (userId) {
+    assets = assets.filter(a => a.userId === userId);
+  }
+
   res.json({
     assets,
-    total: assets.length,
+    total:  assets.length,
+    userId: userId ?? 'all',
     page,
     limit,
   });
@@ -1067,7 +1089,7 @@ app.patch('/api/livestream/:id/window', asyncHandler(async (req, res) => {
  */
 app.post('/api/livestream/:id/clip', asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { recordingAssetId, mode, startTime, endTime, minutes, totalDuration } = req.body;
+  const { recordingAssetId, mode, startTime, endTime, minutes, totalDuration, userId = 'anonymous' } = req.body;
 
   console.log(`[livestream-clip] Stream ${id} body:`, JSON.stringify(req.body));
 
@@ -1143,6 +1165,7 @@ app.post('/api/livestream/:id/clip', asyncHandler(async (req, res) => {
       }],
       playback_policy: ['public'],
       video_quality:   'plus',
+      passthrough:     userId,   // ← tag live clip with userId
     });
   } catch (err) {
     const msg = muxErrorMessage(err);
@@ -1235,41 +1258,106 @@ app.delete('/api/livestream/:id', asyncHandler(async (req, res) => {
 
 
 // ═════════════════════════════════════════════════════════════════════════════
-// MERGE ROUTES
+// MERGE ROUTES — Base44 → Render (FFmpeg) → Mux
+//
+// Flow:
+//   1. POST /api/merge        — download clips from Mux, run FFmpeg concat,
+//                               upload merged MP4 back to Mux via direct upload
+//   2. GET  /api/merge/:jobId — poll in-memory job status
 // ═════════════════════════════════════════════════════════════════════════════
+
+// In-memory job registry — keyed by jobId
+// Shape: { jobId, status, progress, mergedAssetId, playbackId,
+//          streamUrl, downloadUrl, error, createdAt }
+const mergeJobs = new Map();
+
+/**
+ * Downloads a URL to a local temp file. Returns the local file path.
+ */
+async function downloadToTemp(url, filename) {
+  const dest = join(tmpdir(), filename);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download ${url}: ${response.status} ${response.statusText}`);
+  }
+  await pipeline(response.body, createWriteStream(dest));
+  return dest;
+}
+
+/**
+ * Uploads a local file to Mux via direct upload.
+ * Returns the Mux upload object { uploadId, assetId (after processing) }.
+ */
+async function uploadFileToMux(filePath, userId = 'anonymous') {
+  const upload = await video.uploads.create({
+    cors_origin:         '*',
+    new_asset_settings:  {
+      playback_policy: ['public'],
+      video_quality:   'plus',
+      passthrough:     userId,   // ← tag merged video with userId
+    },
+  });
+
+  // Step 2: PUT the file
+  const fileBuffer = await fs.readFile(filePath);
+  const putRes = await fetch(upload.url, {
+    method:  'PUT',
+    headers: { 'Content-Type': 'video/mp4' },
+    body:    fileBuffer,
+  });
+
+  if (!putRes.ok) {
+    throw new Error(`Mux upload PUT failed: ${putRes.status}`);
+  }
+
+  return { uploadId: upload.id };
+}
+
+/**
+ * Polls Mux until the upload's asset is ready. Returns the asset object.
+ */
+async function waitForMuxAsset(uploadId, maxWaitMs = 5 * 60 * 1000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const upload = await video.uploads.retrieve(uploadId);
+    if (upload.asset_id) {
+      const asset = await video.assets.retrieve(upload.asset_id);
+      if (asset.status === 'ready')  return asset;
+      if (asset.status === 'errored') throw new Error('Mux asset processing errored');
+    }
+    await new Promise(r => setTimeout(r, 4000));
+  }
+  throw new Error('Timed out waiting for Mux asset to become ready');
+}
 
 // ── POST /api/merge ───────────────────────────────────────────────────────────
 /**
- * Merges multiple Mux assets into one by creating a single new Mux asset
- * with multiple input segments. Mux concatenates them server-side —
- * no FFmpeg needed on your server, no large file transfers.
+ * Starts an async FFmpeg merge job. Returns a jobId immediately.
+ * The actual work runs in the background — poll GET /api/merge/:jobId.
  *
  * Request body:
  *   {
  *     segments: [
- *       { assetId: string, playbackId: string },  ← in order
- *       { assetId: string, playbackId: string },
- *       ...
+ *       {
+ *         // Existing Mux clip:
+ *         playbackId: string,   ← used to build MP4 download URL
+ *         duration:   number,   ← seconds (for validation only)
+ *         label?:     string,   ← display name
+ *
+ *         // OR new upload (already uploaded to Mux via /api/upload-url):
+ *         assetId:    string,   ← Mux asset ID of newly uploaded clip
+ *         playbackId: string,
+ *         duration:   number,
+ *       },
+ *       ...  (min 2, max 10)
  *     ],
- *     title?: string   ← optional label stored in response only
+ *     title?: string
  *   }
  *
- * Rules:
- *   - Min 2 segments, max 10
- *   - All assets must be status 'ready' before merging
- *   - Order in array = order in final video
- *
- * Response:
- *   {
- *     mergedAssetId: string,
- *     status:        'preparing',
- *     segmentCount:  number,
- *     title:         string,
- *     message:       string,
- *   }
+ * Response: { jobId, status: 'queued', segmentCount, totalDuration }
  */
 app.post('/api/merge', asyncHandler(async (req, res) => {
-  const { segments, title = 'Merged Video' } = req.body;
+  const { segments, title = 'Merged Video', userId = 'anonymous' } = req.body;
 
   // ── Validate ───────────────────────────────────────────────────────────────
   if (!Array.isArray(segments) || segments.length < 2) {
@@ -1279,59 +1367,189 @@ app.post('/api/merge', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Maximum 10 segments per merge' });
   }
   for (const [i, seg] of segments.entries()) {
-    if (!seg.assetId?.trim()) {
-      return res.status(400).json({ error: `segments[${i}].assetId is required` });
+    if (!seg.playbackId?.trim()) {
+      return res.status(400).json({ error: `segments[${i}].playbackId is required` });
+    }
+    if (!seg.duration || isNaN(parseFloat(seg.duration))) {
+      return res.status(400).json({ error: `segments[${i}].duration is required` });
     }
   }
 
-  console.log(`[merge] Merging ${segments.length} segments: ${segments.map(s => s.assetId).join(', ')}`);
+  const totalDuration = segments.reduce((sum, s) => sum + parseFloat(s.duration), 0);
+  const jobId         = randomUUID();
 
-  // ── Build Mux multi-input asset ────────────────────────────────────────────
-  // Mux supports multiple inputs in one asset creation call.
-  // It concatenates them in order automatically.
-  const inputs = segments.map(seg => ({
-    url: `mux://assets/${seg.assetId}`,
-  }));
+  // Register job as queued
+  mergeJobs.set(jobId, {
+    jobId,
+    title,
+    userId,                // ← stored in job for tagging merged asset
+    status:        'queued',
+    progress:      0,
+    segmentCount:  segments.length,
+    totalDuration,
+    mergedAssetId: null,
+    playbackId:    null,
+    streamUrl:     null,
+    downloadUrl:   null,
+    error:         null,
+    createdAt:     new Date().toISOString(),
+  });
 
-  let merged;
-  try {
-    merged = await video.assets.create({
-      input:           inputs,
-      playback_policy: ['public'],
-      video_quality:   'plus',
-    });
-  } catch (err) {
-    const msg = muxErrorMessage(err);
-    console.error(`[merge] Mux error: ${msg}`);
-    return res.status(502).json({ error: `Mux merge failed: ${msg}` });
+  console.log(`[merge] Job ${jobId} queued — ${segments.length} segments, ${formatHuman(totalDuration)}`);
+
+  // Respond immediately with jobId — work runs in background
+  res.status(202).json({
+    jobId,
+    status:                 'queued',
+    title,
+    segmentCount:           segments.length,
+    totalDuration,
+    totalDurationFormatted: formatDuration(totalDuration),
+    totalDurationHuman:     formatHuman(totalDuration),
+    message:                `Merge started — poll GET /api/merge/${jobId}`,
+  });
+
+  // ── Background processing ──────────────────────────────────────────────────
+  // Don't await — runs after response is sent
+  (async () => {
+    const job = mergeJobs.get(jobId);
+    const tempFiles = [];
+
+    try {
+      // Step 1: Download all clips from Mux
+      job.status   = 'downloading';
+      job.progress = 5;
+      mergeJobs.set(jobId, job);
+
+      const localPaths = [];
+      for (const [i, seg] of segments.entries()) {
+        const mp4Url  = `https://stream.mux.com/${seg.playbackId}/capped-1080p.mp4`;
+        const outFile = join(tmpdir(), `clipforge_${jobId}_seg${i}.mp4`);
+        console.log(`[merge:${jobId}] Downloading segment ${i + 1}/${segments.length}`);
+        await downloadToTemp(mp4Url, `clipforge_${jobId}_seg${i}.mp4`);
+        localPaths.push(outFile);
+        tempFiles.push(outFile);
+        job.progress = 5 + Math.floor((i + 1) / segments.length * 35); // 5→40%
+        mergeJobs.set(jobId, job);
+      }
+
+      // Step 2: Write FFmpeg concat list file
+      job.status   = 'merging';
+      job.progress = 42;
+      mergeJobs.set(jobId, job);
+
+      const listPath   = join(tmpdir(), `clipforge_${jobId}_list.txt`);
+      const listContent = localPaths.map(p => `file '${p}'`).join('\n');
+      await fs.writeFile(listPath, listContent, 'utf8');
+      tempFiles.push(listPath);
+
+      const outputPath = join(tmpdir(), `clipforge_${jobId}_merged.mp4`);
+      tempFiles.push(outputPath);
+
+      // Step 3: Run FFmpeg concat (stream copy — fast, no re-encode)
+      console.log(`[merge:${jobId}] Running FFmpeg concat`);
+      await execFileAsync('ffmpeg', [
+        '-f',        'concat',
+        '-safe',     '0',
+        '-i',        listPath,
+        '-c',        'copy',       // stream copy — no re-encode, very fast
+        '-movflags', '+faststart', // optimize for streaming
+        '-y',                      // overwrite output
+        outputPath,
+      ]);
+
+      job.progress = 70;
+      mergeJobs.set(jobId, job);
+
+      // Step 4: Upload merged MP4 to Mux
+      job.status   = 'uploading';
+      job.progress = 72;
+      mergeJobs.set(jobId, job);
+
+      console.log(`[merge:${jobId}] Uploading merged file to Mux`);
+      const { uploadId } = await uploadFileToMux(outputPath, job.userId ?? 'anonymous');
+
+      job.progress = 82;
+      mergeJobs.set(jobId, job);
+
+      // Step 5: Wait for Mux to process the merged asset
+      job.status   = 'processing';
+      job.progress = 85;
+      mergeJobs.set(jobId, job);
+
+      console.log(`[merge:${jobId}] Waiting for Mux asset to be ready`);
+      const asset      = await waitForMuxAsset(uploadId);
+      const playbackId = asset.playback_ids?.[0]?.id ?? null;
+      const downloadUrl = buildDownloadUrl(playbackId, asset.static_renditions);
+
+      // Step 6: Done
+      job.status        = 'done';
+      job.progress      = 100;
+      job.mergedAssetId = asset.id;
+      job.playbackId    = playbackId;
+      job.streamUrl     = playbackId ? `https://stream.mux.com/${playbackId}.m3u8`         : null;
+      job.downloadUrl   = downloadUrl;
+      job.thumbnailUrl  = playbackId ? `https://image.mux.com/${playbackId}/thumbnail.jpg`  : null;
+      job.duration      = asset.duration ?? null;
+      job.durationFormatted = asset.duration ? formatDuration(asset.duration) : null;
+      job.durationHuman     = asset.duration ? formatHuman(asset.duration)    : null;
+      mergeJobs.set(jobId, job);
+
+      console.log(`[merge:${jobId}] ✅ Done — assetId: ${asset.id}`);
+
+    } catch (err) {
+      console.error(`[merge:${jobId}] ❌ Error:`, err.message);
+      job.status = 'failed';
+      job.error  = err.message;
+      mergeJobs.set(jobId, job);
+
+    } finally {
+      // Clean up all temp files
+      for (const f of tempFiles) {
+        fs.unlink(f).catch(() => {});
+      }
+    }
+  })();
+}));
+
+// ── GET /api/merge/:jobId ─────────────────────────────────────────────────────
+/**
+ * Polls the status of a background merge job.
+ * Call every 5 seconds until status = 'done' or 'failed'.
+ *
+ * Status values:
+ *   queued      — waiting to start
+ *   downloading — fetching clip files from Mux
+ *   merging     — FFmpeg running concat
+ *   uploading   — pushing merged file to Mux
+ *   processing  — waiting for Mux to encode merged asset
+ *   done        — complete, downloadUrl and streamUrl available
+ *   failed      — error field contains reason
+ *
+ * Response:
+ *   {
+ *     jobId, status, progress (0–100), title, segmentCount,
+ *     totalDuration, mergedAssetId, playbackId,
+ *     streamUrl, downloadUrl, thumbnailUrl,
+ *     duration, durationFormatted, durationHuman,
+ *     error, createdAt
+ *   }
+ */
+app.get('/api/merge/:jobId', asyncHandler(async (req, res) => {
+  const { jobId } = req.params;
+  const job = mergeJobs.get(jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: `Merge job not found: ${jobId}` });
   }
 
-  res.status(201).json({
-    mergedAssetId: merged.id,
-    status:        'preparing',
-    segmentCount:  segments.length,
-    title,
-    message:       `Merging ${segments.length} clips — poll GET /api/asset-status/${merged.id} for status`,
-  });
+  res.json(job);
 }));
 
 // ── GET /api/asset-status/:assetId ───────────────────────────────────────────
 /**
- * Polls any Mux asset status by assetId directly (not via uploadId).
- * Used for polling merged asset status after POST /api/merge.
- *
- * Response:
- *   {
- *     status:            'preparing' | 'ready' | 'errored',
- *     assetId:           string,
- *     playbackId:        string | null,
- *     duration:          number | null,
- *     durationFormatted: string | null,
- *     durationHuman:     string | null,
- *     streamUrl:         string | null,
- *     downloadUrl:       string | null,
- *     thumbnailUrl:      string | null,
- *   }
+ * Polls any Mux asset by assetId directly.
+ * Useful for checking status of newly uploaded clips before adding to merge queue.
  */
 app.get('/api/asset-status/:assetId', asyncHandler(async (req, res) => {
   const { assetId } = req.params;
@@ -1351,11 +1569,7 @@ app.get('/api/asset-status/:assetId', asyncHandler(async (req, res) => {
   }
 
   if (asset.status === 'errored') {
-    return res.status(422).json({
-      status:  'errored',
-      assetId: asset.id,
-      error:   'Asset processing failed in Mux.',
-    });
+    return res.status(422).json({ status: 'errored', assetId: asset.id, error: 'Asset processing failed.' });
   }
 
   const playbackId  = asset.playback_ids?.[0]?.id ?? null;
@@ -1367,14 +1581,18 @@ app.get('/api/asset-status/:assetId', asyncHandler(async (req, res) => {
     status:            asset.status,
     assetId:           asset.id,
     playbackId,
-    duration:          asset.duration          ?? null,
-    durationFormatted: asset.duration != null   ? formatDuration(asset.duration) : null,
-    durationHuman:     asset.duration != null   ? formatHuman(asset.duration)    : null,
-    streamUrl:         playbackId ? `https://stream.mux.com/${playbackId}.m3u8`           : null,
+    duration:          asset.duration         ?? null,
+    durationFormatted: asset.duration != null  ? formatDuration(asset.duration) : null,
+    durationHuman:     asset.duration != null  ? formatHuman(asset.duration)    : null,
+    streamUrl:         playbackId ? `https://stream.mux.com/${playbackId}.m3u8`          : null,
     downloadUrl,
-    thumbnailUrl:      playbackId ? `https://image.mux.com/${playbackId}/thumbnail.jpg`   : null,
+    thumbnailUrl:      playbackId ? `https://image.mux.com/${playbackId}/thumbnail.jpg`  : null,
   });
 }));
+
+
+
+
 
 
 
@@ -1399,6 +1617,7 @@ app.use((req, res) => {
       'POST   /api/livestream/:id/clip',
       'DELETE /api/livestream/:id',
       'POST   /api/merge',
+      'GET    /api/merge/:jobId',
       'GET    /api/asset-status/:assetId',
     ],
   });
